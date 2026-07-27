@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: docker-list IMAGE[:TAG] [--dockerfile|--dockerfile-only]"
+    echo
+    echo "Exemples :"
+    echo "  docker-list nginx:alpine"
+    echo "  docker-list nginx:alpine --dockerfile"
+    echo "  docker-list nginx:alpine --dockerfile-only"
+    exit 1
+}
+
+IMAGE="${1:-}"
+OPTION="${2:-}"
+
+[[ -n "$IMAGE" ]] || usage
+[[ $# -le 2 ]] || usage
+
+case "$OPTION" in
+    "")
+        SHOW_DOCKERFILE=false
+        DOCKERFILE_ONLY=false
+        ;;
+    --dockerfile)
+        SHOW_DOCKERFILE=true
+        DOCKERFILE_ONLY=false
+        ;;
+    --dockerfile-only)
+        SHOW_DOCKERFILE=true
+        DOCKERFILE_ONLY=true
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+REQUIRED_COMMANDS=(curl awk)
+
+if [[ "$DOCKERFILE_ONLY" != true ]]; then
+    REQUIRED_COMMANDS+=(docker jq)
+fi
+
+for command_name in "${REQUIRED_COMMANDS[@]}"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Erreur : commande manquante : $command_name" >&2
+        exit 1
+    fi
+done
+
+REF="${IMAGE#docker.io/}"
+REF="${REF#registry-1.docker.io/}"
+
+if [[ "$REF" == *@* ]]; then
+    echo "Erreur : cette version attend une image avec un tag et non une référence par digest." >&2
+    exit 1
+fi
+
+LAST_PART="${REF##*/}"
+
+if [[ "$LAST_PART" == *:* ]]; then
+    TAG="${LAST_PART##*:}"
+    REPOSITORY_PATH="${REF%:*}"
+else
+    TAG="latest"
+    REPOSITORY_PATH="$REF"
+fi
+
+if [[ "$REPOSITORY_PATH" != */* ]]; then
+    NAMESPACE="library"
+    REPOSITORY="$REPOSITORY_PATH"
+else
+    NAMESPACE="${REPOSITORY_PATH%%/*}"
+    REPOSITORY="${REPOSITORY_PATH#*/}"
+fi
+
+if [[ "$REPOSITORY" == */* ]]; then
+    echo "Erreur : cette commande est limitée aux images Docker Hub de type namespace/repository." >&2
+    exit 1
+fi
+
+if [[ "$DOCKERFILE_ONLY" != true ]]; then
+    echo
+    echo "===== IMAGE ====="
+    echo "Référence  : $IMAGE"
+    echo "Docker Hub : $NAMESPACE/$REPOSITORY:$TAG"
+
+    echo
+    echo "===== MANIFESTE / PLATEFORMES ====="
+
+    docker buildx imagetools inspect "$IMAGE"
+
+    echo
+    echo "===== MÉTADONNÉES DOCKER HUB ====="
+
+    HUB_URL="https://hub.docker.com/v2/namespaces/${NAMESPACE}/repositories/${REPOSITORY}/tags/${TAG}"
+
+    curl -fsSL "$HUB_URL" | jq '{
+        "tag": .name,
+        "last_updated": .last_updated,
+        "full_size": .full_size,
+        "images": [
+            .images[]? | {
+                "architecture": .architecture,
+                "variant": .variant,
+                "os": .os,
+                "digest": .digest,
+                "size": .size,
+                "status": .status
+            }
+        ]
+    }'
+
+    echo
+    echo "===== CONFIGURATION DE L'IMAGE ====="
+
+    IMAGE_JSON="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image}}')"
+
+    printf '%s\n' "$IMAGE_JSON" | jq '{
+        "created": .created,
+        "architecture": .architecture,
+        "os": .os,
+        "user": .config.User,
+        "working_directory": .config.WorkingDir,
+        "entrypoint": .config.Entrypoint,
+        "command": .config.Cmd,
+        "environment": (.config.Env // []),
+        "exposed_ports": (.config.ExposedPorts // {}),
+        "volumes": (.config.Volumes // {}),
+        "labels": (.config.Labels // {})
+    }'
+
+    echo
+    echo "===== HISTORIQUE DE CONSTRUCTION ====="
+
+    printf '%s\n' "$IMAGE_JSON" | jq -r '
+        .history[]? |
+        [
+            (.created // "-"),
+            (.created_by // "-"),
+            (.comment // "-")
+        ] |
+        @tsv
+    '
+
+    LABEL_SOURCE="$(printf '%s\n' "$IMAGE_JSON" | jq -r '.config.Labels["org.opencontainers.image.source"] // empty')"
+    LABEL_REVISION="$(printf '%s\n' "$IMAGE_JSON" | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
+
+    echo
+    echo "===== SOURCE DÉCLARÉE DANS LES LABELS ====="
+
+    if [[ -n "$LABEL_SOURCE" ]]; then
+        echo "Source   : $LABEL_SOURCE"
+
+        if [[ -n "$LABEL_REVISION" ]]; then
+            echo "Révision : $LABEL_REVISION"
+        fi
+    else
+        echo "Aucun label org.opencontainers.image.source."
+    fi
+fi
+
+if [[ "$NAMESPACE" != "library" ]]; then
+    echo
+    echo "Cette image n'est pas une Docker Official Image du namespace library."
+    echo "La recherche automatique dans docker-library/official-images n'est donc pas disponible."
+    exit 0
+fi
+
+LIBRARY_URL="https://raw.githubusercontent.com/docker-library/official-images/master/library/${REPOSITORY}"
+
+if ! LIBRARY_DATA="$(curl -fsSL "$LIBRARY_URL")"; then
+    echo "Erreur : définition officielle introuvable pour l'image '$REPOSITORY'." >&2
+    exit 1
+fi
+
+GLOBAL_GIT_REPO="$(
+    printf '%s\n' "$LIBRARY_DATA" |
+        awk -F': ' '$1 == "GitRepo" { print $2; exit }'
+)"
+
+STANZA="$(
+    printf '%s\n' "$LIBRARY_DATA" |
+        awk -v wanted="$TAG" '
+            BEGIN {
+                RS = ""
+                FS = "\n"
+            }
+
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Tags: /) {
+                        tags = substr($i, 7)
+                        count = split(tags, values, ",")
+
+                        for (j = 1; j <= count; j++) {
+                            gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[j])
+
+                            if (values[j] == wanted) {
+                                print $0
+                                exit
+                            }
+                        }
+                    }
+                }
+            }
+        '
+)"
+
+echo
+echo "===== DOCKERFILE OFFICIEL ====="
+
+if [[ -z "$STANZA" ]]; then
+    echo "Le tag '$TAG' n'est pas présent dans la définition officielle actuelle."
+    echo "Il peut s'agir d'un ancien tag encore conservé sur Docker Hub."
+    exit 1
+fi
+
+field() {
+    local field_name="$1"
+
+    printf '%s\n' "$STANZA" |
+        awk -F': ' -v expected="$field_name" '
+            $1 == expected {
+                sub(/^[^:]+: /, "")
+                print
+                exit
+            }
+        '
+}
+
+GIT_REPO="$(field GitRepo)"
+GIT_COMMIT="$(field GitCommit)"
+DIRECTORY="$(field Directory)"
+DOCKERFILE="$(field File)"
+
+if [[ -z "$GIT_REPO" ]]; then
+    GIT_REPO="$GLOBAL_GIT_REPO"
+fi
+
+if [[ -z "$DOCKERFILE" ]]; then
+    DOCKERFILE="Dockerfile"
+fi
+
+if [[ -z "$GIT_REPO" || -z "$GIT_COMMIT" ]]; then
+    echo "Impossible de déterminer précisément le dépôt ou le commit du Dockerfile." >&2
+    exit 1
+fi
+
+SOURCE_PATH="${DIRECTORY:+${DIRECTORY}/}${DOCKERFILE}"
+GIT_REPO="${GIT_REPO%.git}"
+
+echo "Dépôt      : $GIT_REPO"
+echo "Commit     : $GIT_COMMIT"
+echo "Répertoire : ${DIRECTORY:-/}"
+echo "Fichier    : $DOCKERFILE"
+
+if [[ "$GIT_REPO" == https://github.com/* ]]; then
+    RAW_REPO="${GIT_REPO/https:\/\/github.com/https:\/\/raw.githubusercontent.com}"
+    GITHUB_URL="${GIT_REPO}/blob/${GIT_COMMIT}/${SOURCE_PATH}"
+    RAW_URL="${RAW_REPO}/${GIT_COMMIT}/${SOURCE_PATH}"
+
+    echo "GitHub     : $GITHUB_URL"
+    echo "Source     : $RAW_URL"
+
+    if [[ "$SHOW_DOCKERFILE" == true ]]; then
+        echo
+        echo "===== CONTENU DU DOCKERFILE ====="
+
+        curl -fsSL "$RAW_URL"
+
+        echo
+    fi
+else
+    echo
+    echo "Le dépôt source n'est pas hébergé sur GitHub."
+    echo "URL du dépôt : $GIT_REPO"
+fi
